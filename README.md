@@ -6,25 +6,24 @@ A study method recommender powered by an **Expert System inference engine**. Bui
 
 ## 🌟 Key Features
 
-1. **Rule-Based Expert System**:
-   - 18 subject-specific rules plus 7 general challenge rules across Math, Science, History, English, Programming, and general topics.
-   - Dynamic struggle filtering: selecting a subject only presents challenges relevant to that domain.
-   - Inference transparency: explains the matched challenge and labels rule coverage as Strong, Good, or a Starting point. These labels are not success probabilities.
-   - See [RULES.md](RULES.md) for the full condition-action table, fallback paths, time policies, and coverage notes.
+**Personalized plans**
+- 11 subjects, including a typed-in "Other" matched to the closest subject family.
+- Level (beginner / intermediate / advanced) changes the challenge options and adds a warm-up or stretch step.
+- Any duration from 5 to 480 minutes; the step count and time breakdown scale to it.
+- Optional exam or deadline: guidance and review schedule depend on the days left.
+- "Why this method works for you" ties each recommendation to the subject, challenge and level.
 
-2. **Time-Aware Inference Engine**:
-   - Adapts the recommended steps and study strategy according to available time (15-min sprint, 30-min session, 60+ min deep dive).
+**Doing and sticking**
+- Timer that runs the plan block by block, highlights the active step, plays a soft chime, keeps accurate time in background tabs and shows the countdown in the tab title.
+- Reorder, edit or skip steps; time and timer re-flow. Confetti when every step is done.
+- Sessions, streaks, total time and a 7-day chart, saved in `localStorage`.
+- 1–5 session rating drives which method is suggested next; spaced review reminders (tomorrow / 3 days / 7 days) with `.ics` calendar export.
 
-3. **Interactive Study Experience**:
-   - **Interactive Step Checklist**: Students can click on recommended steps to check them off in real-time as they work.
-   - **Built-in Focus Sprint Timer**: Countdown timer (with start/pause/reset) synchronized to the user's selected study duration.
-   - **One-Click Plan Copy**: Easily copy the formatted study plan and steps to clipboard for notes or sharing.
-   - **Plan Feedback**: After completing a session, rate whether the recommendation helped. Repeated negative feedback promotes an untried backup method for that challenge; feedback stays in the browser.
-   - **Research Notes**: The page links to research on practice testing and distributed practice, and explains the limits of its rule-fit labels.
+**Sharing**: copy plan, share link (the plan is encoded in the URL hash; nothing is stored on a server), and Export as PDF through the browser's print dialog.
 
-4. **Modern Design Aesthetics**:
-   - Deep dark theme with glassmorphism backdrop filters and ambient mesh glow.
-   - Micro-interactions, animated badges, and responsive layouts for mobile and desktop.
+**Quality**: light/dark theme that follows the system with a manual toggle, skip link, keyboard and screen-reader support, 375px mobile layout, reduced-motion support.
+
+See [RULES.md](RULES.md) for the rule tables and policies.
 
 ---
 
@@ -46,9 +45,10 @@ Run the exhaustive coverage checks from this directory:
 
 ```bash
 python -m unittest test_app.py
+node --test test_logic.js
 ```
 
-The suite checks all 126 listed subject–challenge–time paths and the unknown-challenge fallback.
+The Python suite checks every subject × level × challenge path and the request handlers; the Node suite checks the browser-side logic.
 
 ---
 
