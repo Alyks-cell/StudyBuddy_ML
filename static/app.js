@@ -1512,22 +1512,6 @@
   });
   window.addEventListener("appinstalled", () => { els.installBtn.hidden = true; });
 
-  /* ── Simple / full view ───────────────────────────────────────── */
-  const modeToggle = $("mode-toggle");
-  function applyMode(mode) {
-    document.documentElement.setAttribute("data-mode", mode);
-    modeToggle.textContent = mode === "full" ? "Simple" : "More";
-    modeToggle.setAttribute("aria-pressed", String(mode === "full"));
-    modeToggle.setAttribute("aria-label", mode === "full" ? "Switch to the simple view" : "Show all features");
-    if (mode === "simple") showView("plan", { scroll: false });
-  }
-  modeToggle.addEventListener("click", () => {
-    const next = document.documentElement.getAttribute("data-mode") === "full" ? "simple" : "full";
-    store.setRaw("study-buddy-mode", next);
-    applyMode(next);
-  });
-  applyMode(document.documentElement.getAttribute("data-mode") === "full" ? "full" : "simple");
-
   /* ── Init ─────────────────────────────────────────────────────── */
   updateStepper();
   renderProgress();

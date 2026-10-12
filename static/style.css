@@ -1182,12 +1182,6 @@ body::before {
 [data-mode="simple"] .result-actions { margin-top: 20px; }
 [data-mode="simple"] .step-main { padding-right: 14px; }
 
-.mode-toggle {
-  min-height: 44px; padding: 0 16px; border-radius: 12px;
-  border: 1px solid var(--control-border); background: var(--input-bg);
-  color: var(--text-primary); font-size: 14px; font-weight: 600;
-}
-.mode-toggle:hover { border-color: var(--accent); background: var(--bg-hover); }
 
 /* ── Print / Export as PDF ────────────────────────────────────── */
 @page { margin: 16mm; }

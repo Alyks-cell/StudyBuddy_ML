@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="dark" data-mode="simple">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -31,9 +31,6 @@
       var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
       var theme = saved === 'light' || saved === 'dark' ? saved : (dark ? 'dark' : 'light');
       document.documentElement.setAttribute('data-theme', theme);
-      var mode = null;
-      try { mode = localStorage.getItem('study-buddy-mode'); } catch (e) {}
-      document.documentElement.setAttribute('data-mode', mode === 'full' ? 'full' : 'simple');
       document.documentElement.setAttribute('data-theme-mode', saved === 'light' || saved === 'dark' ? saved : 'auto');
     })();
   </script>
@@ -101,7 +98,6 @@
       <span class="brand-name">Study Buddy</span>
     </a>
     <div class="topbar-actions">
-      <button class="mode-toggle" id="mode-toggle" type="button" aria-pressed="false">More</button>
       <button class="install-btn adv" id="install-btn" type="button" hidden>
         <svg class="ic" width="16" height="16" aria-hidden="true"><use href="#i-download"/></svg><span>Install</span>
       </button>
