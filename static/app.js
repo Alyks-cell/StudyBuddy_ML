@@ -493,7 +493,8 @@
     els.resultMeta.textContent = [plan.subject, plan.struggle, LEVEL_LABELS[plan.level], L.formatMinutes(plan.minutes)].join(" · ");
     els.fitLabel.textContent = `${plan.fit.label} · rule fit, not a probability`;
     els.fitBasis.textContent = plan.fit.basis;
-    els.whyText.textContent = plan.why || plan.reason;
+    // First sentence only: it names the method, the subject and the challenge.
+    els.whyText.textContent = (plan.why.split(/(?<=\.)\s/)[0]) || plan.reason;
     els.methodReason.textContent = plan.why ? plan.reason : "";
     els.methodReason.hidden = !plan.why || !plan.reason;
     els.sharedBanner.hidden = !plan.shared;

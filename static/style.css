@@ -1173,11 +1173,9 @@ body::before {
 [data-mode="simple"] .step-tools { display: none !important; }
 [data-mode="simple"] body { padding-bottom: 32px; }
 [data-mode="simple"] .method-reason-detail { margin-top: 0; font-size: 15px; color: var(--text-secondary); }
-[data-mode="simple"] .why-card .method-reason:first-of-type { margin: 0; }
 [data-mode="simple"] .subject-grid { gap: 14px; }
 [data-mode="simple"] .subject { min-height: 104px; }
 [data-mode="simple"] .subject-name { font-size: 15px; }
-[data-mode="simple"] .divider { margin: 32px 0; }
 [data-mode="simple"] .intro > p { font-size: 18px; }
 [data-mode="simple"] .result-actions { margin-top: 20px; }
 [data-mode="simple"] .step-main { padding-right: 14px; }
