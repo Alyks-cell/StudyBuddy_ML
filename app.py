@@ -1,1094 +1,603 @@
+"""Symptom Triage Helper: a rule-based expert system.
+
+It gives general triage guidance only (how urgently to seek care). It never
+names a diagnosis and is not a substitute for a clinician or emergency services.
+
+Architecture
+------------
+* Knowledge base ... QUESTIONS (what can be asked) and RULES (IF conditions THEN urgency).
+* Working memory .. `facts`, the user's answers so far (a dict).
+* Inference engine  forward chaining: every rule whose conditions all hold fires.
+                    Conflict resolution: the highest urgency among fired rules wins.
+* Question control  asks the next applicable unanswered question, and stops early
+                    as soon as an emergency rule fires.
+* Explanation ..... "why am I asked this?" (which rules use the answer) and
+                    "how was this concluded?" (the rules that fired, in IF-THEN form).
+"""
+
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import json
-import re
 
 ROOT = Path(__file__).parent
 
 # ---------------------------------------------------------------------------
-# Expert System Knowledge Base
-# ---------------------------------------------------------------------------
-# Each rule maps (subject family, struggle) -> recommendation with method,
-# reason, and actionable steps. Subject-specific rules override generic ones.
-# Level, time and deadline modifiers then adapt the plan around the rule.
+# Urgency levels
 # ---------------------------------------------------------------------------
 
-LEVELS = ("beginner", "intermediate", "advanced")
-DEFAULT_LEVEL = "intermediate"
-MIN_MINUTES = 5
-MAX_MINUTES = 480
-
-# Which struggles are relevant per subject
-SUBJECT_STRUGGLES = {
-    "math": [
-        "Memorizing formulas",
-        "Solving word problems",
-        "Understanding concepts",
-        "Showing work / steps",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "science": [
-        "Memorizing terms & definitions",
-        "Understanding concepts",
-        "Connecting theory to experiments",
-        "Interpreting graphs & data",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "biology": [
-        "Memorizing terms & definitions",
-        "Understanding processes & pathways",
-        "Labeling & redrawing diagrams",
-        "Interpreting graphs & data",
-        "Understanding concepts",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "chemistry": [
-        "Memorizing terms & definitions",
-        "Solving calculations (moles, stoichiometry)",
-        "Understanding reaction mechanisms",
-        "Understanding concepts",
-        "Interpreting graphs & data",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "languages": [
-        "Building vocabulary",
-        "Speaking & pronunciation",
-        "Listening comprehension",
-        "Grammar & verb forms",
-        "Writing in the language",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "economics": [
-        "Understanding concepts",
-        "Interpreting graphs & models",
-        "Applying theory to real cases",
-        "Remembering key terms & formulas",
-        "Solving problems",
-        "Writing essays",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "history": [
-        "Remembering dates & events",
-        "Understanding cause & effect",
-        "Writing essays",
-        "Connecting themes across eras",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "english": [
-        "Writing essays",
-        "Understanding literature",
-        "Grammar & sentence structure",
-        "Building vocabulary",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "law": [
-        "Remembering cases & statutes",
-        "Reading cases & statutes",
-        "Applying rules to facts",
-        "Understanding concepts",
-        "Writing essays",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "programming": [
-        "Understanding concepts",
-        "Debugging code",
-        "Solving problems",
-        "Remembering syntax",
-        "Building projects",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
-    "other": [
-        "Understanding concepts",
-        "Remembering facts",
-        "Writing essays",
-        "Preparing for a test",
-        "Staying focused",
-        "Getting started",
-    ],
+LEVELS = {
+    4: {"key": "emergency", "label": "Emergency", "action": "Call your local emergency number now."},
+    3: {"key": "urgent", "label": "Urgent", "action": "Get medical care today."},
+    2: {"key": "soon", "label": "See a doctor soon", "action": "Book an appointment within 1–3 days."},
+    1: {"key": "selfcare", "label": "Self-care at home", "action": "You can probably look after this at home."},
 }
 
-# Challenges that only make sense at a given level. They are shown first so the
-# level choice visibly changes the options, and they have their own generic rules.
-LEVEL_EXTRA_STRUGGLES = {
-    "beginner": ["Understanding the basics", "Not knowing what to study first"],
-    "intermediate": ["Filling gaps in what I know", "Making things stick longer"],
-    "advanced": [
-        "Applying ideas to unfamiliar problems",
-        "Exam speed & accuracy",
-        "Finding my last weak spots",
-    ],
-}
-
-# Challenges that are rarely the right focus at a given level.
-LEVEL_HIDDEN_STRUGGLES = {
-    "beginner": {
-        "connecting themes across eras",
-        "connecting theory to experiments",
-        "building projects",
-    },
-    "intermediate": set(),
-    "advanced": {"getting started"},
-}
-
-_LEVEL_EXTRA_KEYS = {s.lower() for items in LEVEL_EXTRA_STRUGGLES.values() for s in items}
-
-# Typed-in subjects ("Other") are mapped to the closest known subject family so
-# the plan stays relevant. Order matters: the first family that matches wins.
-SUBJECT_KEYWORDS = [
-    ("programming", r"python|java|javascript|typescript|coding|programming|computer science|c\+\+|c#|sql|html|css|software|algorithm|data structure|react|rust|golang|web dev|machine learning"),
-    ("chemistry", r"chem|organic|stoichiometr|biochem"),
-    ("biology", r"bio|anatomy|physiolog|ecolog|genetic|zoolog|botan|microbio|medic|nursing|neuro|pharmac"),
-    ("math", r"math|algebra|calculus|geometr|trigonometr|statistic|probabilit|arithmetic|linear|discrete|numeric"),
-    ("science", r"physic|astronom|geolog|earth science|environmental|science|engineering"),
-    ("languages", r"spanish|french|german|italian|japanese|chinese|mandarin|korean|arabic|latin|russian|portuguese|hindi|dutch|swedish|greek|language|esl|vocab"),
-    ("economics", r"econom|financ|accounting|business|marketing|commerce|management"),
-    ("law", r"law|legal|jurisprud|contract|tort|constitution|bar exam|criminal|statut"),
-    ("history", r"histor|politic|geograph|archaeolog|civics|government|anthropolog|sociolog"),
-    ("english", r"english|literature|writing|poetry|essay|composition|rhetoric|linguistic|novel"),
-]
-
-# ---- Rules ----------------------------------------------------------------
-
-_TERM_FLASHCARDS = (
-    "Term–Example Flashcards",
-    "Connecting a term to a real example helps you remember what it means and when it applies.",
-    [
-        "Write the term on one side of a card, the definition + a real example on the other.",
-        "Quiz yourself: see the term, recall the definition and example.",
-        "Sort cards into 'got it' and 'missed it' piles.",
-        "Repeat the missed pile until you clear it.",
-    ],
+DISCLAIMER = (
+    "This tool gives general guidance only. It is not a diagnosis and does not replace a doctor, "
+    "nurse or emergency services. If you think it is an emergency, call your local emergency number "
+    "(for example 911, 999 or 112) instead of using this checker."
 )
 
-_GRAPH_NARRATION = (
-    "Graph Narration",
-    "Describing a graph in plain language forces you to understand what the data is showing.",
-    [
-        "Read the title, axis labels, and units first.",
-        "Describe the overall trend in one sentence (rising, falling, steady).",
-        "Identify any outliers or turning points.",
-        "Write one sentence connecting the trend to the concept you are studying.",
-    ],
-)
-
-# (subject, struggle) -> (method, reason, steps[])
-# Specific rules take priority; generic struggle rules are the fallback.
-RULES = {
-    # ── Math ───────────────────────────────────────────────────────────────
-    ("math", "memorizing formulas"): (
-        "Formula Deconstruction",
-        "Breaking a formula into named parts and practicing it in context builds both understanding and recall.",
-        [
-            "Write the formula and label what each symbol means.",
-            "Solve five practice problems without looking at the formula or solution.",
-            "Check your answers and note which formulas or steps you forgot.",
-            "Retry the missed problems from memory, then explain when the formula applies.",
-        ],
-    ),
-    ("math", "solving word problems"): (
-        "Translate → Plan → Solve",
-        "Word problems are hard because they hide the math in language. Translating first removes that barrier.",
-        [
-            "Read the problem and underline the key numbers and what you're asked to find.",
-            "Rewrite the problem as a math equation or expression.",
-            "Solve the equation step by step.",
-            "Check: does your answer make sense in the original context?",
-        ],
-    ),
-    ("math", "understanding concepts"): (
-        "Concept Mapping",
-        "Math concepts connect to each other. Mapping them reveals the logic you're missing.",
-        [
-            "Read the definition or theorem in your textbook.",
-            "In your own words, explain what it means and when you'd use it.",
-            "Draw a simple diagram or example that illustrates the idea.",
-            "Connect it to a concept you already understand.",
-        ],
-    ),
-    ("math", "showing work / steps"): (
-        "Narrated Solution Practice",
-        "Writing out every step forces your brain to make the implicit reasoning explicit.",
-        [
-            "Pick a practice problem and write each step on a new line.",
-            "Next to each step, write a short reason why you did it.",
-            "Compare your steps to a textbook solution — did you skip anything?",
-            "Redo the problem, this time filling in any missing steps.",
-        ],
-    ),
-
-    # ── Science ────────────────────────────────────────────────────────────
-    ("science", "memorizing terms & definitions"): _TERM_FLASHCARDS,
-    ("science", "connecting theory to experiments"): (
-        "Hypothesis–Evidence Bridge",
-        "Linking what you expected to happen with what actually happened makes lab work meaningful.",
-        [
-            "State the theory or principle the experiment tests.",
-            "Write your hypothesis — what should happen if the theory is true?",
-            "Summarize your actual observations or data in one sentence.",
-            "Explain whether the data supports or contradicts the hypothesis and why.",
-        ],
-    ),
-    ("science", "interpreting graphs & data"): _GRAPH_NARRATION,
-
-    # ── Biology ────────────────────────────────────────────────────────────
-    ("biology", "understanding processes & pathways"): (
-        "Process Chain Retelling",
-        "Processes like respiration or protein synthesis are sequences. Retelling them link by link shows where the chain breaks.",
-        [
-            "List the stages of the process in order, with the input and output of each.",
-            "Cover the list and retell the process aloud as a short story.",
-            "Check against your notes and mark any stage you skipped or swapped.",
-            "Add one sentence per stage about why it matters to the next stage.",
-        ],
-    ),
-    ("biology", "labeling & redrawing diagrams"): (
-        "Blank Diagram Redraw",
-        "Redrawing a diagram from memory tests recall of both the parts and how they connect.",
-        [
-            "Study the diagram for two minutes, naming each part aloud.",
-            "Cover it and redraw the diagram from memory on a blank page.",
-            "Label every part, then compare with the original and mark what you missed.",
-            "Redraw only the parts you missed, then label them again.",
-        ],
-    ),
-
-    # ── Chemistry ──────────────────────────────────────────────────────────
-    ("chemistry", "solving calculations (moles, stoichiometry)"): (
-        "Unit-Tracked Worked Calculations",
-        "Carrying units through every line catches most calculation errors and shows what each step is converting.",
-        [
-            "Write what you are given and what you need, with units.",
-            "Write the chain of conversions (for example grams → moles → moles of product → grams) before any numbers.",
-            "Calculate step by step, carrying units on every line and cancelling them as you go.",
-            "Sanity-check the size and units of the answer, then redo one similar problem without notes.",
-        ],
-    ),
-    ("chemistry", "understanding reaction mechanisms"): (
-        "Mechanism Storyboard",
-        "Mechanisms are stories about electrons. Drawing each step as a frame makes the logic visible instead of memorized.",
-        [
-            "Draw the reactants and mark where electrons are rich and where they are poor.",
-            "Draw one arrow at a time showing where the electrons move, one frame per step.",
-            "Cover your frames and redraw the full mechanism from the reactants.",
-            "Explain in one sentence why each step happens before the next one.",
-        ],
-    ),
-
-    # ── Languages ──────────────────────────────────────────────────────────
-    ("languages", "building vocabulary"): (
-        "Sentence-Mined Flashcards",
-        "Words learned inside a sentence are easier to recall and use than words learned in isolation.",
-        [
-            "Pick 8 words you met in a real text or dialogue and copy the sentence each came from.",
-            "On each card put the word on one side and the sentence (with the word hidden) on the other.",
-            "Recall the meaning, then say a new sentence of your own aloud using the word.",
-            "Re-test only the missed cards tomorrow.",
-        ],
-    ),
-    ("languages", "speaking & pronunciation"): (
-        "Shadow → Record → Compare",
-        "Imitating a native speaker and hearing yourself back makes the gaps in your pronunciation audible.",
-        [
-            "Choose a 30-second audio clip and read its transcript once.",
-            "Play it in short chunks and repeat each chunk immediately, matching rhythm and sounds.",
-            "Record yourself reading the same text, then listen to both versions back to back.",
-            "Note two sounds or stress patterns to fix and re-record just those lines.",
-        ],
-    ),
-    ("languages", "listening comprehension"): (
-        "Listen → Transcribe → Check",
-        "Writing down what you hear forces your ear to process every word, not just the gist.",
-        [
-            "Pick a short clip (30–60 seconds) and listen once for the overall meaning.",
-            "Replay in short chunks and write down exactly what you hear.",
-            "Compare with the transcript and mark words you misheard or did not know.",
-            "Listen once more without the transcript and note what you now catch.",
-        ],
-    ),
-    ("languages", "grammar & verb forms"): (
-        "Pattern Notice → Produce",
-        "Seeing a pattern in real sentences and then producing your own builds intuition faster than memorizing rules.",
-        [
-            "Collect five example sentences that use the grammar point.",
-            "Underline what changes in each and write the pattern as a one-line rule.",
-            "Write five new sentences about your own life using the pattern.",
-            "Check them against a reference and fix any errors, noting the rule.",
-        ],
-    ),
-    ("languages", "writing in the language"): (
-        "Short Write → Self-Correct",
-        "A short text that you correct yourself builds accuracy because you must notice errors, not just receive them.",
-        [
-            "Write 5–6 sentences on a simple topic without a dictionary.",
-            "Read them aloud and mark anything that sounds wrong or that you avoided.",
-            "Look up the marked words and rules, then rewrite the passage.",
-            "Keep a short list of your most frequent mistakes to check next time.",
-        ],
-    ),
-
-    # ── Economics ──────────────────────────────────────────────────────────
-    ("economics", "interpreting graphs & models"): (
-        "Draw → Shift → Explain",
-        "Drawing a model and shifting a curve yourself shows cause and effect, which memorizing the picture does not.",
-        [
-            "Draw the model (for example supply and demand) from memory with labeled axes.",
-            "Pick one change (a tax, a new technology, a rise in income) and shift the right curve.",
-            "Mark the new equilibrium and write what happened to price and quantity, and why.",
-            "Repeat with a different change and compare the two outcomes.",
-        ],
-    ),
-    ("economics", "applying theory to real cases"): (
-        "Case → Model → Prediction",
-        "Applying a model to a concrete news story turns abstract theory into something you can reason with.",
-        [
-            "Pick a short news story or real-world example.",
-            "Name the economic concept or model that best fits it and why.",
-            "Predict what the model says should happen next.",
-            "Note where reality differs from the model and give one reason.",
-        ],
-    ),
-    ("economics", "remembering key terms & formulas"): (
-        "Definition + Diagram Cards",
-        "Pairing a definition with a small sketch or example gives you two routes back to the idea.",
-        [
-            "Make a card for each term: definition on one side, a mini diagram or example on the other.",
-            "Quiz yourself: see the term, recall the definition and sketch the example.",
-            "Sort into 'know' and 'missed' piles.",
-            "Repeat the missed pile until you clear it, then test the formulas by writing them from memory.",
-        ],
-    ),
-
-    # ── History ────────────────────────────────────────────────────────────
-    ("history", "remembering dates & events"): (
-        "Timeline Story Building",
-        "Putting events in sequence and linking cause/effect turns isolated dates into a story.",
-        [
-            "Pick 5–8 key events and arrange them on a timeline.",
-            "For each event, write: what happened, what caused it, and what changed after.",
-            "Cover the timeline and try to recreate it from memory.",
-            "Check your version — add back anything you forgot.",
-        ],
-    ),
-    ("history", "understanding cause & effect"): (
-        "Because → Therefore Chain",
-        "Tracing a chain of causes shows how events lead into each other instead of seeming random.",
-        [
-            "Make a timeline of five key events in this topic.",
-            "For each event, write one cause and one effect.",
-            "Cover your notes and quiz yourself on what caused each event and what followed.",
-            "Check your answers and explain the strongest cause-and-effect link in your own words.",
-        ],
-    ),
-    ("history", "connecting themes across eras"): (
-        "Theme Comparison Table",
-        "A table makes it easy to spot how the same theme (power, economy, culture) played out differently.",
-        [
-            "Choose a theme (e.g., democracy, trade, conflict).",
-            "Create a simple table with one column per era or region.",
-            "Fill in how the theme appeared in each era with a specific example.",
-            "Write one sentence about what changed over time and why.",
-        ],
-    ),
-
-    # ── English ────────────────────────────────────────────────────────────
-    ("english", "understanding literature"): (
-        "Close Reading + Annotation",
-        "Marking up a passage forces you to slow down and notice the author's choices.",
-        [
-            "Pick a short passage (1–2 paragraphs).",
-            "Read it once for the overall meaning.",
-            "Read again and underline key words, imagery, or tone shifts.",
-            "Write 2–3 sentences: what is the author doing here and why?",
-        ],
-    ),
-    ("english", "grammar & sentence structure"): (
-        "Error Hunt + Rewrite",
-        "Finding and fixing grammar errors in context builds intuition faster than memorizing rules.",
-        [
-            "Take a paragraph from your own writing.",
-            "Read each sentence aloud — mark anything that sounds off.",
-            "Look up the specific grammar rule for each issue.",
-            "Rewrite the sentences correctly and note the rule you applied.",
-        ],
-    ),
-    ("english", "building vocabulary"): (
-        "Context–Use–Review Cycle",
-        "Using a new word in your own sentence cements it far better than just reading a definition.",
-        [
-            "Pick 5 new words from your reading.",
-            "Write each word's definition in your own words.",
-            "Use each word in a sentence about something in your life.",
-            "Review your sentences the next day — can you recall the meanings?",
-        ],
-    ),
-
-    # ── Law ────────────────────────────────────────────────────────────────
-    ("law", "remembering cases & statutes"): (
-        "Case Brief Cards",
-        "A one-card brief with the same fields for every case makes cases comparable and quick to retrieve.",
-        [
-            "For each case write a card with: facts, issue, rule, holding, and reasoning in one line each.",
-            "Cover the card and recall the holding and the reasoning from the case name alone.",
-            "Check, and mark any field you could not recall.",
-            "Retry the marked cards and say which other case each one is closest to.",
-        ],
-    ),
-    ("law", "reading cases & statutes"): (
-        "Skim → Read → Brief",
-        "Knowing what you are looking for before reading dense text keeps you from getting lost in it.",
-        [
-            "Skim the headings, the first and last paragraphs, and any holding to learn what the text is about.",
-            "Read it through once, marking the facts, the legal question and the court's answer.",
-            "Write a three-sentence brief from memory: facts, rule, outcome.",
-            "Re-read only the parts that did not fit your brief and fix it.",
-        ],
-    ),
-    ("law", "applying rules to facts"): (
-        "IRAC Drill",
-        "Structuring an answer as Issue, Rule, Application, Conclusion makes you apply the rule rather than just state it.",
-        [
-            "Read a fact pattern and write the issue as a single question.",
-            "State the rule, including its elements, in your own words.",
-            "Apply each element to the facts in turn, noting facts that cut both ways.",
-            "Write a one-line conclusion, then compare with a model answer and note anything missed.",
-        ],
-    ),
-
-    # ── Programming ────────────────────────────────────────────────────────
-    ("programming", "understanding concepts"): (
-        "Code → Explain → Modify",
-        "Running code and explaining what it does line-by-line builds real comprehension.",
-        [
-            "Find or write a small code example that uses the concept.",
-            "Add a comment to every line explaining what it does.",
-            "Predict what happens if you change one part, then test it.",
-            "Summarize the concept in your own words based on what you learned.",
-        ],
-    ),
-    ("programming", "debugging code"): (
-        "Isolate → Reproduce → Fix",
-        "Systematic debugging beats random guessing every time.",
-        [
-            "Read the error message carefully — note the line number and error type.",
-            "Create the smallest possible code that reproduces the bug.",
-            "Add print statements or use a debugger to trace variable values.",
-            "Fix the issue, then explain why the bug happened to avoid it next time.",
-        ],
-    ),
-    ("programming", "solving problems"): (
-        "Pseudocode First",
-        "Planning in plain language before coding prevents getting lost in syntax.",
-        [
-            "Read the problem and restate it in one sentence.",
-            "List the inputs, outputs, and any constraints.",
-            "Write step-by-step pseudocode in plain language.",
-            "Translate each pseudocode step into real code one at a time.",
-        ],
-    ),
-    ("programming", "remembering syntax"): (
-        "Cheat Sheet + Drill",
-        "Building your own reference and using it actively is more effective than memorizing.",
-        [
-            "Create a one-page cheat sheet of the syntax you keep forgetting.",
-            "Write 3 small code snippets that use that syntax.",
-            "Try to write them again tomorrow without looking.",
-            "Update your cheat sheet with anything you missed.",
-        ],
-    ),
-    ("programming", "building projects"): (
-        "Feature Slice Approach",
-        "Breaking a project into tiny vertical slices makes it less overwhelming.",
-        [
-            "Write a one-sentence description of the simplest possible version.",
-            "List 3–5 features, ordered from essential to nice-to-have.",
-            "Build only the first feature until it works end-to-end.",
-            "Commit, then move to the next feature.",
-        ],
-    ),
-}
-
-# Generic fallback rules (keyed by struggle only)
-GENERIC_RULES = {
-    "understanding concepts": (
-        "Read → Recall → Check",
-        "Explaining from memory reveals which parts you truly understand.",
-        [
-            "Read a short section of your material.",
-            "Close your notes and explain the idea in plain language.",
-            "Check your notes and fill in any gaps you missed.",
-            "Repeat with the next section.",
-        ],
-    ),
-    "remembering facts": (
-        "Active Recall Flashcards",
-        "Retrieving information from memory strengthens it more than rereading.",
-        [
-            "Turn key facts into question-and-answer cards.",
-            "Quiz yourself — don't flip until you've tried to answer.",
-            "Sort into 'know' and 'don't know' piles.",
-            "Repeat the 'don't know' pile until you clear it.",
-        ],
-    ),
-    "memorizing terms & definitions": _TERM_FLASHCARDS,
-    "interpreting graphs & data": _GRAPH_NARRATION,
-    "writing essays": (
-        "Thesis → Outline → Draft",
-        "Planning the argument first gives your writing a clear structure.",
-        [
-            "Write a one-sentence thesis that states your main claim.",
-            "List 2–3 supporting points with evidence for each.",
-            "Outline each paragraph: claim → evidence → explanation.",
-            "Draft one paragraph at a time from your outline.",
-        ],
-    ),
-    "preparing for a test": (
-        "Self-Test & Target Review",
-        "A quick self-test reveals what you know so you can focus review where it matters most.",
-        [
-            "Try a short closed-notes practice quiz.",
-            "Mark every question you weren't confident about.",
-            "Review the material for those weak topics.",
-            "Retake a similar quiz and compare your results.",
-        ],
-    ),
-    "staying focused": (
-        "Single-Task Sprint",
-        "A single clear task with a defined endpoint makes it easier to begin and stay engaged.",
-        [
-            "Pick one specific task (e.g., 'solve problems 1–5').",
-            "Put away your phone and close unrelated tabs.",
-            "Work on that single task until the timer ends.",
-            "Take a short break, then decide your next task.",
-        ],
-    ),
-    "getting started": (
-        "Two-Minute Launch",
-        "Starting with a tiny action lowers the effort it takes to begin.",
-        [
-            "Open your material and set a 2-minute timer.",
-            "Do the smallest useful thing: read one paragraph or answer one question.",
-            "When the timer ends, decide whether to continue or take a break.",
-            "Most of the time, you'll keep going — starting is the hardest part.",
-        ],
-    ),
-    "solving problems": (
-        "Worked Example → Solo Attempt",
-        "Studying a solution first, then trying independently, bridges the gap between knowing and doing.",
-        [
-            "Study a worked solution step by step.",
-            "Cover the solution and attempt a similar problem.",
-            "Compare your solution to the reference.",
-            "Note any steps you missed and retry.",
-        ],
-    ),
-
-    # ── Level-specific challenges ──────────────────────────────────────────
-    "understanding the basics": (
-        "Define → Example → Restate",
-        "When the basics are new, a plain definition plus one concrete example gives you something solid to hang later ideas on.",
-        [
-            "Pick one core idea and write its definition from your material.",
-            "Find or write one simple, concrete example of it.",
-            "Close your notes and restate the idea and the example in your own words.",
-            "Check, fix anything off, then do the same with the next core idea.",
-        ],
-    ),
-    "not knowing what to study first": (
-        "Topic Map → Core First",
-        "Seeing the whole topic on one page shows which ideas the rest depend on, so you know where to begin.",
-        [
-            "List every topic or heading in your material on one page.",
-            "Circle the 3 that the others seem to depend on.",
-            "Rank those 3 from most to least basic and pick the first.",
-            "Spend the rest of the session on just that one, using a short recall check at the end.",
-        ],
-    ),
-    "filling gaps in what i know": (
-        "Blank-Page Brain Dump",
-        "Writing everything you remember without help exposes the exact gaps, so review time goes where it is needed.",
-        [
-            "On a blank page, write everything you remember about one topic for a few minutes.",
-            "Open your notes and add what you missed in a different color.",
-            "List the three biggest gaps as questions.",
-            "Answer those questions from your material, then try the brain dump again.",
-        ],
-    ),
-    "making things stick longer": (
-        "Spaced Retrieval Round",
-        "Recalling something after a delay, rather than straight after reading it, is what makes it last.",
-        [
-            "Pick material you studied at least a day ago and write 6 questions about it.",
-            "Answer them from memory without looking.",
-            "Check your answers and mark any that were wrong or slow.",
-            "Plan when you will quiz yourself on the marked ones again.",
-        ],
-    ),
-    "applying ideas to unfamiliar problems": (
-        "Vary → Solve → Explain Why",
-        "Solving problems that look different from the ones you practiced is what builds flexible, transferable skill.",
-        [
-            "Take a problem you can already solve and change its context or constraints.",
-            "Solve the new version without notes.",
-            "Write down what stayed the same and what you had to adapt, and why.",
-            "Repeat with a problem from a different topic that needs the same idea.",
-        ],
-    ),
-    "exam speed & accuracy": (
-        "Timed Mixed Practice",
-        "Practicing under realistic time pressure with mixed topics trains the retrieval and decision speed an exam asks for.",
-        [
-            "Select a set of mixed questions and set a timer slightly tighter than the exam allows.",
-            "Work through them without notes, skipping any that stall you for more than a minute.",
-            "Mark each answer as right, wrong or guessed.",
-            "For each wrong or guessed one, write the cause: knowledge, misread or rushed.",
-        ],
-    ),
-    "finding my last weak spots": (
-        "Error Log Review",
-        "Tracking the specific mistakes you keep making shows the few patterns that are costing you the most.",
-        [
-            "Collect your recent mistakes from practice questions or past work.",
-            "Group them by cause (concept, careless, misread, memory).",
-            "Pick the biggest group and write one rule or check that would have prevented it.",
-            "Do three fresh questions using that rule and see if the mistake disappears.",
-        ],
-    ),
-}
-
-# Time presets (kept for backward compatibility with the old three-button UI).
-TIME_MODIFIERS = {
-    "short": {"label": "~15 minutes", "minutes": 15, "max_steps": 2},
-    "medium": {"label": "~30 minutes", "minutes": 30, "max_steps": 4},
-    "long": {"label": "60+ minutes", "minutes": 60, "max_steps": 5},
-}
-
-ALTERNATIVE_METHODS = {
-    "Spaced Repetition": {
-        "description": "Review the same ideas again after a short delay to strengthen long-term recall.",
-        "steps": ["Turn the key ideas into questions.", "Try to answer each question from memory.", "Check your notes and mark missed answers.", "Review missed questions tomorrow, then again in a few days."],
-    },
-    "Active Recall": {
-        "description": "Close your notes and retrieve the answer from memory before checking it.",
-        "steps": ["Choose one small topic or idea.", "Close your notes and write what you remember.", "Check your notes and correct missing details.", "Repeat with a new question, then revisit missed parts later."],
-    },
-    "Feynman Technique": {
-        "description": "Explain the idea in plain language, then revisit any part you cannot explain.",
-        "steps": ["Choose one idea you want to understand.", "Explain it aloud in plain language without notes.", "Check your notes for gaps or jargon you could not explain.", "Rewrite the explanation simply and try again."],
-    },
-    "Cornell Notes": {
-        "description": "Turn your notes into cue questions and use them to quiz yourself later.",
-        "steps": ["Divide a page into notes, cue questions, and summary areas.", "Write concise notes while studying.", "Add recall questions in the cue column and summarize the page.", "Cover the notes and answer the cue questions from memory."],
-    },
-    "Pomodoro": {
-        "description": "Focus on one task for a timed sprint, then take a short break.",
-        "steps": ["Choose one specific task and define what done means.", "Set a timer for a focused work sprint.", "Work only on that task until the timer ends.", "Take a short break and decide the next task."],
-    },
-}
-
-METHOD_ALTERNATIVES = {
-    "active recall": ["Spaced Repetition", "Feynman Technique"],
-    "spaced repetition": ["Active Recall", "Cornell Notes"],
-    "feynman technique": ["Active Recall", "Cornell Notes"],
-    "cornell notes": ["Active Recall", "Spaced Repetition"],
-    "pomodoro": ["Active Recall", "Spaced Repetition"],
-}
-
-# ---- Why it works ---------------------------------------------------------
-# Every method is tied to the learning principle that makes it work, so the
-# explanation can say why it fits *this* subject and challenge.
-
-PRINCIPLES = {
-    "retrieval": "pulling answers out of memory (retrieval practice) strengthens recall far more than rereading, and shows you exactly what is still shaky",
-    "explain": "explaining an idea in your own words (self-explanation) forces you to connect it to what you already know and exposes gaps you cannot see while reading",
-    "worked": "studying a worked example before trying one yourself keeps the mental load low enough to learn the pattern, then practice makes it yours",
-    "organize": "organizing information into a map, table or timeline makes the relationships visible, which is what you need to remember and apply it",
-    "start": "a tiny, concrete first action removes the effort of starting, and momentum usually carries you into real work",
-    "spacing": "revisiting material after a delay (spaced practice) is what turns short-term familiarity into long-term memory",
-    "produce": "producing the answer yourself, rather than recognizing it, is what trains the skill you will actually need to use",
-}
-
-METHOD_PRINCIPLE = {
-    "formula deconstruction": "retrieval",
-    "translate → plan → solve": "worked",
-    "concept mapping": "organize",
-    "narrated solution practice": "explain",
-    "term–example flashcards": "retrieval",
-    "hypothesis–evidence bridge": "explain",
-    "graph narration": "explain",
-    "process chain retelling": "retrieval",
-    "blank diagram redraw": "retrieval",
-    "unit-tracked worked calculations": "worked",
-    "mechanism storyboard": "organize",
-    "sentence-mined flashcards": "retrieval",
-    "shadow → record → compare": "produce",
-    "listen → transcribe → check": "produce",
-    "pattern notice → produce": "produce",
-    "short write → self-correct": "produce",
-    "draw → shift → explain": "organize",
-    "case → model → prediction": "explain",
-    "definition + diagram cards": "retrieval",
-    "timeline story building": "organize",
-    "because → therefore chain": "organize",
-    "theme comparison table": "organize",
-    "close reading + annotation": "explain",
-    "error hunt + rewrite": "produce",
-    "context–use–review cycle": "produce",
-    "case brief cards": "retrieval",
-    "skim → read → brief": "organize",
-    "irac drill": "produce",
-    "code → explain → modify": "explain",
-    "isolate → reproduce → fix": "worked",
-    "pseudocode first": "organize",
-    "cheat sheet + drill": "retrieval",
-    "feature slice approach": "organize",
-    "read → recall → check": "retrieval",
-    "active recall flashcards": "retrieval",
-    "thesis → outline → draft": "organize",
-    "self-test & target review": "retrieval",
-    "single-task sprint": "start",
-    "two-minute launch": "start",
-    "worked example → solo attempt": "worked",
-    "define → example → restate": "explain",
-    "topic map → core first": "organize",
-    "blank-page brain dump": "retrieval",
-    "spaced retrieval round": "spacing",
-    "vary → solve → explain why": "produce",
-    "timed mixed practice": "retrieval",
-    "error log review": "organize",
-    "active recall check": "retrieval",
-    "spaced repetition": "spacing",
-    "active recall": "retrieval",
-    "feynman technique": "explain",
-    "cornell notes": "organize",
-    "pomodoro": "start",
-}
-
-LEVEL_WHY = {
-    "beginner": "As a beginner you get a short warm-up first, so you meet a simple example before you practice.",
-    "intermediate": "At an intermediate level the aim is to find and close the gaps rather than re-learn the basics.",
-    "advanced": "At an advanced level the plan ends with a harder stretch task, because easy practice no longer teaches you much.",
-}
-
-
 # ---------------------------------------------------------------------------
-# Helpers
+# Knowledge base: questions
 # ---------------------------------------------------------------------------
+# type "single": pick one. type "multi": pick any; "none" is exclusive.
+# `complaint`: the question is only asked for that main problem.
 
-def clean_text(value, limit=80):
-    """Collapse whitespace, drop control characters and cap the length."""
-    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:limit].strip()
-
-
-def normalize_level(level):
-    level = str(level or "").strip().lower()
-    return level if level in LEVELS else DEFAULT_LEVEL
-
-
-def resolve_subject(subject, custom_subject=None):
-    """Return (family, display name) for a chosen or typed-in subject."""
-    key = clean_text(subject, 60).lower()
-    custom = clean_text(custom_subject, 60)
-    if key in SUBJECT_STRUGGLES and key != "other":
-        return key, key.title()
-    typed = custom or (key if key and key != "other" else "")
-    if not typed:
-        return "other", "Other"
-    lowered = typed.lower()
-    for family, pattern in SUBJECT_KEYWORDS:
-        for token in pattern.split("|"):
-            # Short tokens must start a word ("law" is not "outlaw"); longer
-            # ones may appear inside a word ("microeconomics" contains "econom").
-            if re.search((r"\b" if len(token) <= 4 else "") + token, lowered):
-                return family, typed
-    return "other", typed
-
-
-def get_struggles(subject, level=DEFAULT_LEVEL, custom_subject=None):
-    """Return the list of struggles relevant to a subject and level."""
-    family, _ = resolve_subject(subject, custom_subject)
-    level = normalize_level(level)
-    hidden = LEVEL_HIDDEN_STRUGGLES[level]
-    base = [s for s in SUBJECT_STRUGGLES[family] if s.lower() not in hidden]
-    return LEVEL_EXTRA_STRUGGLES[level] + base
-
-
-def resolve_minutes(time_available="medium", minutes=None):
-    """Prefer an explicit minute count; otherwise map the preset."""
-    if minutes is not None and minutes != "":
-        try:
-            value = int(round(float(minutes)))
-            return max(MIN_MINUTES, min(MAX_MINUTES, value))
-        except (TypeError, ValueError, OverflowError):
-            pass
-    preset = TIME_MODIFIERS.get(str(time_available).strip().lower(), TIME_MODIFIERS["medium"])
-    return preset["minutes"]
-
-
-def format_minutes(minutes):
-    if minutes < 60:
-        return f"{minutes} min"
-    hours, rest = divmod(minutes, 60)
-    return f"{hours} h" if rest == 0 else f"{hours} h {rest} min"
-
-
-def max_steps_for(minutes):
-    if minutes < 10:
-        return 1
-    if minutes < 20:
-        return 2
-    if minutes < 30:
-        return 3
-    if minutes < 45:
-        return 4
-    return 5
-
-
-def time_note_for(minutes):
-    if minutes < 10:
-        return "With under 10 minutes, do just one small, concrete task. Even a very short session builds momentum."
-    if minutes < 20:
-        return "With limited time, focus on the first 2 steps. Even a short session builds momentum."
-    if minutes < 30:
-        return "You have time for the core of the method. Keep the last few minutes for checking what you remember."
-    if minutes < 45:
-        return "You have enough time to complete the full method. Take a short break if needed."
-    if minutes < 90:
-        return "Great — you can complete the full method and repeat it with a second topic or problem set."
-    return "This is a long block. Take a 5–10 minute break every 45–50 minutes so the later steps still get your full attention."
-
-
-def apply_level(steps, level, display, struggle):
-    """Add a warm-up for beginners or a stretch task for advanced learners."""
-    steps = list(steps)
-    if struggle in _LEVEL_EXTRA_KEYS:
-        return steps
-    material = f"your {display} material" if display != "Other" else "your material"
-    if level == "beginner":
-        steps.insert(
-            0,
-            f"Warm up: skim {material} and pick one simple example or definition to start from. Keep your notes open for your first attempt.",
-        )
-    elif level == "advanced":
-        steps.append(
-            "Stretch: redo a harder or timed item without any notes, and write down what you would do differently."
-        )
-    return steps
-
-
-def deadline_guidance(days_left, exam):
-    """Describe how the plan changes for the number of days left."""
-    if days_left is None:
-        return None
-    label = exam or "your deadline"
-    if days_left == 0:
-        headline = f"{label} is today."
-        tips = [
-            "Use this session only for quick retrieval of the highest-value topics; skip new material.",
-            "Fix the two or three things you are least sure of, then stop and rest.",
-            "Do a final quick recall check shortly before you go in.",
-        ]
-        offsets, mode = [], "today"
-    elif days_left == 1:
-        headline = f"{label} is tomorrow."
-        tips = [
-            "Focus on the topics most likely to come up and your known weak spots; do not start anything new.",
-            "Test yourself closed-notes rather than rereading.",
-            "Finish early and sleep: memory consolidates overnight.",
-        ]
-        offsets, mode = [], "tomorrow"
-    elif days_left <= 3:
-        headline = f"{days_left} days until {label}."
-        tips = [
-            "Prioritize weak topics: spend most of your time where you lose the most marks.",
-            "Do one full closed-notes practice run the day before the last day.",
-            "Re-test yesterday's missed items at the start of each session.",
-        ]
-        offsets, mode = [1], "crunch"
-    elif days_left <= 7:
-        headline = f"{days_left} days until {label}."
-        tips = [
-            "Aim for one focused session a day, rotating through topics.",
-            "Take a practice test about 2 days before and use it to choose what to review.",
-            "Revisit each topic at least twice before the deadline.",
-        ]
-        offsets, mode = [1, 3], "week"
-    elif days_left <= 14:
-        headline = f"{days_left} days until {label}."
-        tips = [
-            "Plan 4–5 sessions a week and give each topic a first pass in the first half.",
-            "Use the second half for mixed practice and past papers.",
-            "Space your reviews: tomorrow, in 3 days, then in 7.",
-        ]
-        offsets, mode = [1, 3, 7], "fortnight"
-    else:
-        headline = f"{days_left} days until {label}."
-        tips = [
-            "You have a long runway: 3–4 short sessions a week beat occasional marathons.",
-            "Map the whole syllabus first, then work through it topic by topic.",
-            "Add a weekly self-test and review anything that slips.",
-        ]
-        offsets, mode = [1, 3, 7], "long"
-    # Reviews that would land on or after the deadline are not useful.
-    offsets = [o for o in offsets if o < days_left]
+def _q(qid, short, text, qtype, options, why, complaint=None):
     return {
-        "days_left": days_left,
-        "exam": exam,
-        "mode": mode,
-        "headline": headline,
-        "tips": tips,
-        "review_offsets": offsets,
+        "id": qid, "short": short, "text": text, "type": qtype,
+        "options": [{"value": v, "label": label} for v, label in options],
+        "why": why, "complaint": complaint,
     }
 
 
-def deadline_step(days_left):
-    """An extra first step that reflects how close the deadline is, or None."""
-    if days_left is None:
-        return None
-    if days_left <= 1:
-        return "Triage: list the 3 topics you are least sure of that are most likely to come up, and work only on those."
-    if days_left >= 15:
-        return "Map the syllabus: list every topic and mark each green, amber or red; today work on one red topic."
-    return None
+QUESTIONS = [
+    _q("redflags", "Danger signs", "Right now, do you have any of these?", "multi", [
+        ("breathing", "Severe trouble breathing, or can't speak a full sentence"),
+        ("chest", "Chest pain, pressure or tightness"),
+        ("blue", "Blue or grey lips or face"),
+        ("faint", "Fainted, can't be woken, or sudden confusion"),
+        ("stroke", "Sudden face drooping, arm or leg weakness, or slurred speech"),
+        ("bleeding", "Heavy bleeding that won't stop with firm pressure"),
+        ("seizure", "A seizure (fit) now or just now"),
+        ("allergy", "Swelling of lips, face or tongue, or throat tightness after a sting, food or medicine"),
+        ("selfharm", "Thoughts of harming yourself or someone else"),
+        ("none", "None of these"),
+    ], "Some problems are dangerous whatever else is going on, so they are checked first. "
+       "If you choose any of them, the questions stop and you are told what to do straight away."),
+
+    _q("age", "Age group", "How old is the person who needs advice?", "single", [
+        ("baby_u3m", "Under 3 months"),
+        ("baby", "3 to 11 months"),
+        ("child", "1 to 12 years"),
+        ("adult", "13 to 64 years"),
+        ("senior", "65 or older"),
+    ], "Age changes how serious the same symptom is. For example, a fever in a very young baby "
+       "is treated far more cautiously than in an adult."),
+
+    _q("complaint", "Main problem", "What is the main problem?", "single", [
+        ("fever", "Fever, or feeling feverish"),
+        ("cough", "Cough or a breathing problem"),
+        ("throat", "Sore throat or cold"),
+        ("headache", "Headache"),
+        ("stomach", "Stomach upset (vomiting, diarrhea, belly pain)"),
+        ("other", "Something else"),
+    ], "The main problem decides which follow-up questions are relevant, so you are not asked about "
+       "things that don't apply."),
+
+    _q("risk", "Higher-risk condition",
+       "Does any of this apply? A long-term illness (heart, lung, kidney, diabetes), a weakened "
+       "immune system (for example chemotherapy, steroids or a transplant), or pregnancy.",
+       "single", [("yes", "Yes"), ("no", "No")],
+       "Some conditions make infections and other problems riskier, so the same symptoms may need "
+       "care sooner."),
+
+    # ── Fever ──────────────────────────────────────────────────────────────
+    _q("temp", "Highest temperature", "What is the highest temperature so far?", "single", [
+        ("under38", "Under 38 °C (100.4 °F)"),
+        ("t38", "38 to 38.9 °C (100.4 to 102 °F)"),
+        ("t39", "39 to 39.9 °C (102.1 to 103.8 °F)"),
+        ("t40", "40 °C (104 °F) or higher"),
+        ("unknown", "Not measured, but feels hot"),
+    ], "How high the fever is helps judge how seriously the body is reacting.", "fever"),
+    _q("fever_days", "Fever length", "How long has the fever lasted?", "single", [
+        ("d0", "Less than 1 day"),
+        ("d1_3", "1 to 3 days"),
+        ("d3p", "More than 3 days"),
+    ], "A fever that lasts is more likely to need a check than one that has just started.", "fever"),
+    _q("fever_sx", "Fever warning signs", "Any of these with the fever?", "multi", [
+        ("stiff", "Stiff neck, or pain when looking at bright light"),
+        ("rash", "A rash that does not fade when a glass is pressed on it"),
+        ("drowsy", "Very drowsy, floppy or hard to wake"),
+        ("vomit", "Repeated vomiting, can't keep fluids down"),
+        ("urine", "Pain or burning when passing urine"),
+        ("none", "None of these"),
+    ], "These signs can mean a fever is more than a simple infection, so they raise the urgency.", "fever"),
+
+    # ── Cough / breathing ──────────────────────────────────────────────────
+    _q("cough_breath", "Breathing", "How is your breathing?", "single", [
+        ("normal", "Normal"),
+        ("exert", "A bit short of breath when active or climbing stairs"),
+        ("rest", "Short of breath even at rest or while talking"),
+    ], "Breathlessness is one of the strongest signs that a cough needs attention.", "cough"),
+    _q("cough_days", "Cough length", "How long have you had the cough?", "single", [
+        ("lt1w", "Under 1 week"),
+        ("w1_3", "1 to 3 weeks"),
+        ("w3p", "More than 3 weeks"),
+    ], "Most coughs from colds fade within about 3 weeks. A longer cough should be checked.", "cough"),
+    _q("cough_sx", "Cough warning signs", "Any of these?", "multi", [
+        ("blood", "Coughing up blood"),
+        ("wheeze", "Wheezing or a whistling sound when breathing"),
+        ("fever", "Fever of 38 °C (100.4 °F) or higher"),
+        ("chestpain", "Chest pain when breathing in or coughing"),
+        ("none", "None of these"),
+    ], "These signs change how urgently a cough should be looked at.", "cough"),
+
+    # ── Sore throat / cold ─────────────────────────────────────────────────
+    _q("throat_sx", "Throat warning signs", "Any of these?", "multi", [
+        ("drool", "Can't swallow your own saliva, or drooling"),
+        ("muffled", "Muffled voice, or can't open your mouth fully"),
+        ("fever", "High fever (38.5 °C / 101.3 °F or more) and no cough"),
+        ("patches", "White patches or pus on the tonsils"),
+        ("none", "None of these"),
+    ], "A few throat symptoms point to problems that need a clinician, not just rest.", "throat"),
+    _q("throat_days", "Throat length", "How long has the sore throat lasted?", "single", [
+        ("lt1w", "Less than a week"),
+        ("w1p", "A week or more"),
+    ], "Sore throats from colds usually settle within a week.", "throat"),
+
+    # ── Headache ───────────────────────────────────────────────────────────
+    _q("ha_onset", "Headache start", "How did the headache start?", "single", [
+        ("thunder", "Suddenly: the worst headache of my life, peaking within a minute"),
+        ("gradual", "Gradually, over hours or days"),
+    ], "A sudden, severe 'thunderclap' headache is treated as an emergency.", "headache"),
+    _q("ha_sx", "Headache warning signs", "Any of these?", "multi", [
+        ("injury", "It started after a blow to the head"),
+        ("vision", "Vision changes: blurred, double or lost vision"),
+        ("vomit", "Repeated vomiting"),
+        ("neck", "Fever and a stiff neck"),
+        ("worse", "Pain getting steadily worse over days or weeks, or waking me at night"),
+        ("none", "None of these"),
+    ], "These are the headache features that doctors want to see sooner rather than later.", "headache"),
+    _q("ha_known", "Familiar headache", "Have you had headaches like this before?", "single", [
+        ("yes", "Yes, similar to before"),
+        ("no", "No, this feels new or different"),
+    ], "A new kind of headache is judged differently from one you already know.", "headache"),
+
+    # ── Stomach ────────────────────────────────────────────────────────────
+    _q("gi_sx", "Stomach warning signs", "Any of these?", "multi", [
+        ("bloodgi", "Vomiting blood, or black or bloody stools"),
+        ("hard", "A very swollen, hard or rigid belly"),
+        ("severe", "Severe belly pain that is constant or getting worse"),
+        ("rlq", "Pain low on the right side of the belly, with fever"),
+        ("dehyd", "Dehydration: very dry mouth, little or no urine in 8 hours, dizzy when standing"),
+        ("none", "None of these"),
+    ], "These signs separate a common stomach upset from something needing care.", "stomach"),
+    _q("gi_fluids", "Keeping fluids down", "Can you keep fluids down?", "single", [
+        ("yes", "Yes"),
+        ("no", "No, I vomit most fluids"),
+    ], "Not being able to keep fluids down leads to dehydration, especially in the young and old.", "stomach"),
+    _q("gi_days", "Stomach length", "How long have the symptoms lasted?", "single", [
+        ("lt2", "Less than 2 days"),
+        ("d2_7", "2 to 7 days"),
+        ("d7p", "More than 7 days"),
+    ], "Most stomach upsets pass within a couple of days.", "stomach"),
+]
+
+QUESTION_BY_ID = {q["id"]: q for q in QUESTIONS}
+
+# ---------------------------------------------------------------------------
+# Knowledge base: rules
+# ---------------------------------------------------------------------------
+# A rule is: id, level, if (list of conditions, ALL must hold), reason.
+# A condition is (fact, operator, value):
+#   "is"    answer equals value
+#   "in"    answer is one of the values
+#   "has"   a multi-answer contains any of the values
+#   "lacks" a multi-answer contains none of the values
+# Every complaint has a level-1 baseline rule, so there is always a conclusion.
+
+YOUNG = ["baby_u3m", "baby", "child"]
+BABIES = ["baby_u3m", "baby"]
+GROWN = ["adult", "senior"]
+FEVER_38 = ["t38", "t39", "t40", "unknown"]
 
 
-def why_it_works(method, subject, struggle, level, days_left=None):
-    """Short explanation of why a method fits this subject and challenge."""
-    principle = PRINCIPLES[METHOD_PRINCIPLE.get(method.lower(), "retrieval")]
-    where = f"in {subject}" if subject != "Other" else "in your subject"
-    text = (
-        f"{method} suits {struggle.lower()} {where} because {principle}."
-    )
-    if level in LEVEL_WHY:
-        text += " " + LEVEL_WHY[level]
-    if days_left is not None:
-        if days_left <= 1:
-            text += " With so little time left, it concentrates your effort on retrieval instead of new input."
-        elif days_left <= 7:
-            text += " With under a week to go, it keeps each session pointed at what you can still improve."
-        else:
-            text += " With time on your side, you can repeat it and let spacing do its work."
-    return text
+def _r(rid, level, conditions, reason):
+    return {"id": rid, "level": level, "if": conditions, "reason": reason}
 
 
-def build_alternatives(method, subject, struggle, level, days_left):
-    names = METHOD_ALTERNATIVES.get(method.lower(), ["Active Recall", "Spaced Repetition"])
-    results = []
-    for name in names:
-        if method.lower().startswith(name.lower()):
-            continue
-        info = ALTERNATIVE_METHODS[name]
-        results.append({
-            "method": name,
-            **info,
-            "why": why_it_works(name, subject, struggle, None, None),
-        })
-    return results[:2]
+RULES = [
+    # ── Danger signs (any age, any problem) ────────────────────────────────
+    _r("RF1", 4, [("redflags", "has", ["breathing"])], "Severe trouble breathing can become life-threatening quickly."),
+    _r("RF2", 4, [("redflags", "has", ["chest"])], "Chest pain, pressure or tightness can be a sign of a heart problem and needs emergency assessment."),
+    _r("RF3", 4, [("redflags", "has", ["blue"])], "Blue or grey lips or face can mean the body is not getting enough oxygen."),
+    _r("RF4", 4, [("redflags", "has", ["faint"])], "Fainting, being unable to wake, or sudden confusion needs emergency help."),
+    _r("RF5", 4, [("redflags", "has", ["stroke"])], "Sudden face drooping, limb weakness or slurred speech can be signs of a stroke. Minutes matter."),
+    _r("RF6", 4, [("redflags", "has", ["bleeding"])], "Heavy bleeding that will not stop with firm pressure needs emergency help."),
+    _r("RF7", 4, [("redflags", "has", ["seizure"])], "A seizure needs emergency assessment, especially a first one or one lasting over 5 minutes."),
+    _r("RF8", 4, [("redflags", "has", ["allergy"])], "Swelling of the lips, face or tongue, or throat tightness, can be a severe allergic reaction."),
+    _r("RF9", 4, [("redflags", "has", ["selfharm"])], "You may be at risk of harm. Please contact emergency services or a crisis line now; you do not have to face this alone."),
 
+    # ── Fever ──────────────────────────────────────────────────────────────
+    _r("F1", 4, [("complaint", "is", "fever"), ("age", "is", "baby_u3m"), ("temp", "in", FEVER_38)],
+       "A fever of 38 °C or more in a baby under 3 months needs an emergency assessment, even if the baby looks well."),
+    _r("F2", 3, [("complaint", "is", "fever"), ("age", "is", "baby_u3m")],
+       "Any sign of fever in a baby under 3 months should be checked by a clinician today."),
+    _r("F3", 3, [("complaint", "is", "fever"), ("age", "is", "baby"), ("temp", "in", ["t39", "t40", "unknown"])],
+       "A high or unmeasured fever in a baby aged 3 to 11 months should be checked today."),
+    _r("F4", 2, [("complaint", "is", "fever"), ("age", "is", "baby"), ("temp", "is", "t38")],
+       "A fever in a baby aged 3 to 11 months should be checked by a doctor soon."),
+    _r("F5", 4, [("complaint", "is", "fever"), ("fever_sx", "has", ["stiff", "rash"])],
+       "A stiff neck, light sensitivity or a rash that does not fade, together with fever, can be signs of a serious infection that needs emergency care."),
+    _r("F6", 4, [("complaint", "is", "fever"), ("age", "in", YOUNG), ("fever_sx", "has", ["drowsy"])],
+       "A feverish child or baby who is very drowsy, floppy or hard to wake needs emergency care."),
+    _r("F7", 3, [("complaint", "is", "fever"), ("age", "in", GROWN), ("fever_sx", "has", ["drowsy"])],
+       "Being very drowsy with a fever should be assessed by a clinician today."),
+    _r("F8", 3, [("complaint", "is", "fever"), ("temp", "is", "t40")],
+       "A temperature of 40 °C or higher should be assessed today."),
+    _r("F9", 3, [("complaint", "is", "fever"), ("fever_sx", "has", ["vomit"]), ("age", "in", YOUNG + ["senior"])],
+       "Repeated vomiting with a fever risks dehydration, which is more dangerous in the very young and the elderly."),
+    _r("F10", 2, [("complaint", "is", "fever"), ("fever_sx", "has", ["vomit"]), ("age", "is", "adult")],
+       "Repeated vomiting with a fever can lead to dehydration and should be checked soon."),
+    _r("F11", 3, [("complaint", "is", "fever"), ("risk", "is", "yes"), ("temp", "in", FEVER_38)],
+       "A fever with a long-term illness, a weakened immune system or pregnancy should be assessed today."),
+    _r("F12", 3, [("complaint", "is", "fever"), ("age", "is", "senior"), ("temp", "in", ["t39", "t40"])],
+       "A high fever in someone aged 65 or older should be assessed today."),
+    _r("F13", 2, [("complaint", "is", "fever"), ("age", "is", "senior"), ("temp", "is", "t38")],
+       "A fever in someone aged 65 or older should be checked soon."),
+    _r("F14", 2, [("complaint", "is", "fever"), ("age", "is", "child"), ("temp", "in", ["t39", "t40"])],
+       "A high fever in a child should be checked by a doctor soon if it does not settle."),
+    _r("F15", 2, [("complaint", "is", "fever"), ("fever_days", "is", "d3p")],
+       "A fever lasting more than 3 days should be checked."),
+    _r("F16", 2, [("complaint", "is", "fever"), ("fever_sx", "has", ["urine"])],
+       "Pain or burning when passing urine with a fever can mean an infection that needs treatment."),
+    _r("F0", 1, [("complaint", "is", "fever")],
+       "Fever on its own is common with infections and often settles with rest and fluids."),
+
+    # ── Cough / breathing ──────────────────────────────────────────────────
+    _r("C1", 3, [("complaint", "is", "cough"), ("cough_breath", "is", "rest")],
+       "Being short of breath at rest or while talking should be assessed today."),
+    _r("C2", 3, [("complaint", "is", "cough"), ("cough_sx", "has", ["blood"])],
+       "Coughing up blood should be assessed today."),
+    _r("C3", 3, [("complaint", "is", "cough"), ("age", "in", YOUNG), ("cough_sx", "has", ["wheeze"])],
+       "Wheezing in a baby or child should be assessed today."),
+    _r("C4", 2, [("complaint", "is", "cough"), ("age", "in", GROWN), ("cough_sx", "has", ["wheeze"])],
+       "Wheezing should be checked by a doctor soon."),
+    _r("C5", 3, [("complaint", "is", "cough"), ("age", "is", "baby_u3m")],
+       "A cough in a baby under 3 months should be checked today."),
+    _r("C6", 3, [("complaint", "is", "cough"), ("age", "is", "baby"), ("cough_breath", "in", ["exert", "rest"])],
+       "Breathing difficulty with a cough in a baby should be checked today."),
+    _r("C7", 2, [("complaint", "is", "cough"), ("cough_breath", "is", "exert")],
+       "Being short of breath when active should be checked soon."),
+    _r("C8", 2, [("complaint", "is", "cough"), ("cough_days", "is", "w3p")],
+       "A cough lasting more than 3 weeks should be checked."),
+    _r("C9", 3, [("complaint", "is", "cough"), ("risk", "is", "yes"), ("cough_sx", "has", ["fever"])],
+       "A cough with fever and a long-term illness, weakened immune system or pregnancy should be assessed today."),
+    _r("C10", 2, [("complaint", "is", "cough"), ("cough_sx", "has", ["chestpain"])],
+       "Chest pain when breathing or coughing should be checked soon."),
+    _r("C11", 2, [("complaint", "is", "cough"), ("cough_sx", "has", ["fever"]), ("cough_days", "in", ["w1_3", "w3p"])],
+       "A cough with fever lasting over a week should be checked."),
+    _r("C0", 1, [("complaint", "is", "cough")],
+       "Most coughs come from colds and clear up on their own within about 3 weeks."),
+
+    # ── Sore throat / cold ─────────────────────────────────────────────────
+    _r("S1", 4, [("complaint", "is", "throat"), ("throat_sx", "has", ["drool"])],
+       "Being unable to swallow saliva, or drooling, can mean the airway is at risk and needs emergency care."),
+    _r("S2", 3, [("complaint", "is", "throat"), ("throat_sx", "has", ["muffled"])],
+       "A muffled voice or being unable to open the mouth fully should be assessed today."),
+    _r("S3", 3, [("complaint", "is", "throat"), ("risk", "is", "yes"), ("throat_sx", "has", ["fever"])],
+       "A high fever with a sore throat and a higher-risk condition should be assessed today."),
+    _r("S4", 2, [("complaint", "is", "throat"), ("throat_sx", "has", ["fever"])],
+       "A high fever with a sore throat and no cough should be checked soon."),
+    _r("S5", 2, [("complaint", "is", "throat"), ("throat_sx", "has", ["patches"])],
+       "White patches or pus on the tonsils should be checked soon."),
+    _r("S6", 2, [("complaint", "is", "throat"), ("throat_days", "is", "w1p")],
+       "A sore throat lasting a week or more should be checked."),
+    _r("S0", 1, [("complaint", "is", "throat")],
+       "Most sore throats come from colds and settle within a week."),
+
+    # ── Headache ───────────────────────────────────────────────────────────
+    _r("H1", 4, [("complaint", "is", "headache"), ("ha_onset", "is", "thunder")],
+       "A sudden, severe 'worst ever' headache needs emergency assessment."),
+    _r("H2", 4, [("complaint", "is", "headache"), ("ha_sx", "has", ["neck"])],
+       "A headache with fever and a stiff neck can be a sign of a serious infection and needs emergency care."),
+    _r("H3", 3, [("complaint", "is", "headache"), ("ha_sx", "has", ["injury"])],
+       "A headache after a blow to the head should be assessed today."),
+    _r("H4", 3, [("complaint", "is", "headache"), ("ha_sx", "has", ["vision"])],
+       "A headache with vision changes should be assessed today."),
+    _r("H5", 3, [("complaint", "is", "headache"), ("ha_sx", "has", ["vomit"])],
+       "A headache with repeated vomiting should be assessed today."),
+    _r("H6", 2, [("complaint", "is", "headache"), ("ha_sx", "has", ["worse"])],
+       "A headache that keeps getting worse, or wakes you at night, should be checked soon."),
+    _r("H7", 2, [("complaint", "is", "headache"), ("ha_known", "is", "no"), ("age", "is", "senior")],
+       "A new kind of headache at 65 or older should be checked soon."),
+    _r("H8", 2, [("complaint", "is", "headache"), ("ha_known", "is", "no"), ("risk", "is", "yes")],
+       "A new kind of headache with a higher-risk condition should be checked soon."),
+    _r("H0", 1, [("complaint", "is", "headache")],
+       "Most headaches are tension-type or migraine-type and ease with rest, fluids and pain relief."),
+
+    # ── Stomach upset ──────────────────────────────────────────────────────
+    _r("G1", 4, [("complaint", "is", "stomach"), ("gi_sx", "has", ["bloodgi"])],
+       "Vomiting blood, or black or bloody stools, can mean serious bleeding and needs emergency care."),
+    _r("G2", 4, [("complaint", "is", "stomach"), ("gi_sx", "has", ["hard"])],
+       "A very swollen, hard belly needs emergency assessment."),
+    _r("G3", 3, [("complaint", "is", "stomach"), ("gi_sx", "has", ["severe"])],
+       "Severe belly pain that is constant or getting worse should be assessed today."),
+    _r("G4", 3, [("complaint", "is", "stomach"), ("gi_sx", "has", ["rlq"])],
+       "Pain low on the right side with fever should be assessed today."),
+    _r("G5", 3, [("complaint", "is", "stomach"), ("gi_sx", "has", ["dehyd"])],
+       "Signs of dehydration should be assessed today."),
+    _r("G6", 3, [("complaint", "is", "stomach"), ("gi_fluids", "is", "no"), ("age", "in", YOUNG + ["senior"])],
+       "Not keeping fluids down risks dehydration, which is more dangerous in the very young and the elderly."),
+    _r("G7", 3, [("complaint", "is", "stomach"), ("gi_fluids", "is", "no"), ("risk", "is", "yes")],
+       "Not keeping fluids down with a higher-risk condition should be assessed today."),
+    _r("G8", 2, [("complaint", "is", "stomach"), ("gi_fluids", "is", "no"), ("age", "is", "adult")],
+       "Not keeping fluids down should be checked soon."),
+    _r("G9", 3, [("complaint", "is", "stomach"), ("age", "is", "baby_u3m")],
+       "Vomiting, diarrhea or belly pain in a baby under 3 months should be checked today."),
+    _r("G10", 2, [("complaint", "is", "stomach"), ("gi_days", "is", "d7p")],
+       "Stomach symptoms lasting more than a week should be checked."),
+    _r("G11", 2, [("complaint", "is", "stomach"), ("gi_days", "is", "d2_7"), ("age", "in", ["baby", "child", "senior"])],
+       "Stomach symptoms lasting more than 2 days in a baby, child or older adult should be checked."),
+    _r("G0", 1, [("complaint", "is", "stomach")],
+       "Most stomach upsets pass within a couple of days with fluids and rest."),
+
+    # ── Not covered ────────────────────────────────────────────────────────
+    _r("X1", 2, [("complaint", "is", "other")],
+       "This checker only covers fever, cough, sore throat, headache and stomach upset. For anything else, talk to a doctor or nurse."),
+]
+
+RULE_BY_ID = {r["id"]: r for r in RULES}
+
+# ---------------------------------------------------------------------------
+# Advice shown with the result
+# ---------------------------------------------------------------------------
+
+ADVICE = {
+    4: [
+        "Call your local emergency number now (for example 911, 999 or 112).",
+        "Do not drive yourself. Stay with the person and unlock the door if you can.",
+        "Follow the instructions of the call-taker, and do not eat or drink unless told to.",
+    ],
+    3: [
+        "Get medical care today: a same-day appointment, an urgent-care clinic, or your local nurse or health advice line.",
+        "If it gets worse, or you cannot be seen soon, go to emergency care.",
+        "Take a list of medicines and, if you can, someone to go with you.",
+    ],
+    2: [
+        "Book an appointment with a doctor or clinic within 1 to 3 days.",
+        "Meanwhile rest, drink fluids, and note how symptoms change.",
+        "If any warning sign below appears, get care sooner.",
+    ],
+}
+
+SELFHARM_ADVICE = (
+    "If you or someone else may be in danger of self-harm, call your local emergency number. "
+    "In the US you can also call or text 988 for crisis support; elsewhere, contact your local crisis line."
+)
+
+SELF_CARE = {
+    "fever": [
+        "Rest and drink plenty of fluids.",
+        "Wear light clothing and keep the room comfortable, not cold.",
+        "Paracetamol (acetaminophen) or ibuprofen can ease discomfort. Follow the label for the person's age, and never give aspirin to anyone under 16.",
+    ],
+    "cough": [
+        "Rest and drink warm fluids. Honey in a warm drink can soothe a cough (not for babies under 1).",
+        "Keep away from smoke.",
+        "Most coughs from colds fade within about 3 weeks.",
+    ],
+    "throat": [
+        "Drink warm fluids and rest your voice.",
+        "Adults can gargle warm salt water or use throat lozenges (not for young children).",
+        "Pain relief can help: follow the label for the person's age.",
+    ],
+    "headache": [
+        "Rest in a quiet, dim room and drink water.",
+        "Eat regular meals, and try to keep a regular sleep pattern.",
+        "Pain relief can help: follow the label, and avoid using it on most days of the week.",
+    ],
+    "stomach": [
+        "Sip fluids little and often. An oral rehydration solution is best if you have one.",
+        "Eat small, plain meals once you feel hungry.",
+        "Rest and wash your hands often to avoid passing it on.",
+    ],
+}
+
+WATCH_FOR = {
+    "fever": [
+        "A temperature of 40 °C (104 °F) or higher",
+        "Fever lasting more than 3 days",
+        "A stiff neck, a rash that does not fade, or being very drowsy",
+        "Trouble breathing, or not keeping fluids down",
+    ],
+    "cough": [
+        "Breathlessness at rest, or blue lips",
+        "Coughing up blood",
+        "A cough lasting more than 3 weeks",
+        "Chest pain or a high fever",
+    ],
+    "throat": [
+        "Not being able to swallow saliva, or drooling",
+        "A muffled voice or being unable to open your mouth",
+        "A high fever, or white patches on the tonsils",
+        "Symptoms lasting more than a week",
+    ],
+    "headache": [
+        "A sudden, severe headache unlike any before",
+        "Fever with a stiff neck",
+        "Vision changes, weakness, or repeated vomiting",
+        "Pain that keeps getting worse",
+    ],
+    "stomach": [
+        "Vomiting blood, or black or bloody stools",
+        "Severe or worsening belly pain, or a hard belly",
+        "Signs of dehydration, or not keeping fluids down",
+        "Symptoms lasting more than a week",
+    ],
+}
 
 # ---------------------------------------------------------------------------
 # Inference engine
 # ---------------------------------------------------------------------------
 
-def recommend(subject, struggle, time_available="medium", level=DEFAULT_LEVEL,
-              minutes=None, custom_subject=None, exam=None, days_left=None):
-    """Return a study recommendation using the expert system rules."""
-    family, display = resolve_subject(subject, custom_subject)
-    struggle = clean_text(struggle, 80).lower()
-    level = normalize_level(level)
-    total_minutes = resolve_minutes(time_available, minutes)
-    exam = clean_text(exam, 80) or None
-    if days_left is not None:
-        try:
-            days_left = int(days_left)
-        except (TypeError, ValueError):
-            days_left = None
+
+def label_of(qid, value):
+    for option in QUESTION_BY_ID[qid]["options"]:
+        if option["value"] == value:
+            return option["label"]
+    return str(value)
+
+
+def match(condition, facts):
+    """True if a single condition holds. Unanswered facts never match."""
+    fact, op, value = condition
+    answer = facts.get(fact)
+    if answer is None:
+        return False
+    if op == "is":
+        return answer == value
+    if op == "in":
+        return answer in value
+    if op == "has":
+        return isinstance(answer, list) and any(v in answer for v in value)
+    if op == "lacks":
+        return isinstance(answer, list) and not any(v in answer for v in value)
+    raise ValueError(f"unknown operator {op}")
+
+
+def fire_rules(facts):
+    """Forward chaining: every rule whose conditions all hold fires."""
+    return [rule for rule in RULES if all(match(c, facts) for c in rule["if"])]
+
+
+def describe_condition(condition):
+    fact, op, value = condition
+    short = QUESTION_BY_ID[fact]["short"]
+    names = [label_of(fact, v) for v in (value if isinstance(value, list) else [value])]
+    if op == "is":
+        return f"{short} is “{names[0]}”"
+    if op == "in":
+        return f"{short} is one of: " + "; ".join(f"“{n}”" for n in names)
+    if op == "has":
+        return f"{short} includes: " + "; ".join(f"“{n}”" for n in names) + " (any)"
+    return f"{short} includes none of: " + "; ".join(f"“{n}”" for n in names)
+
+
+def describe_rule(rule):
+    return {
+        "id": rule["id"],
+        "level": rule["level"],
+        "level_label": LEVELS[rule["level"]]["label"],
+        "if": [describe_condition(c) for c in rule["if"]],
+        "then": rule["reason"],
+    }
+
+
+def rules_using(qid):
+    return sorted({r["id"] for r in RULES for c in r["if"] if c[0] == qid})
+
+
+def applies(question, facts):
+    wanted = question["complaint"]
+    return wanted is None or facts.get("complaint") == wanted
+
+
+def unanswered(facts):
+    return [q for q in QUESTIONS if q["id"] not in facts and applies(q, facts)]
+
+
+def validate_facts(raw):
+    """Check untrusted answers against the question definitions."""
+    if not isinstance(raw, dict):
+        raise ValueError("facts must be an object")
+    facts = {}
+    for qid, answer in raw.items():
+        question = QUESTION_BY_ID.get(qid)
+        if question is None:
+            raise ValueError(f"unknown question: {qid}")
+        values = {o["value"] for o in question["options"]}
+        if question["type"] == "single":
+            if not isinstance(answer, str) or answer not in values:
+                raise ValueError(f"invalid answer for {qid}")
+            facts[qid] = answer
         else:
-            if days_left < 0 or days_left > 3650:
-                days_left = None
+            if (not isinstance(answer, list) or not answer or len(answer) > len(values)
+                    or not all(isinstance(a, str) and a in values for a in answer)
+                    or len(set(answer)) != len(answer)):
+                raise ValueError(f"invalid answer for {qid}")
+            if "none" in answer and len(answer) > 1:
+                raise ValueError(f"'none' cannot be combined for {qid}")
+            facts[qid] = list(answer)
+    return facts
 
-    # 1. Try subject-specific rule
-    result = RULES.get((family, struggle))
-    fired_rule = f"{family} + {struggle}" if result else None
 
-    # 2. Fall back to generic struggle rule
-    if not result:
-        result = GENERIC_RULES.get(struggle)
-        fired_rule = f"generic: {struggle}" if result else None
+def build_result(facts, fired):
+    top = max((r["level"] for r in fired), default=2)
+    level = LEVELS[top]
+    top_rules = sorted((r for r in fired if r["level"] == top), key=lambda r: r["id"])
+    others = sorted((r for r in fired if r["level"] < top and r["level"] > 1), key=lambda r: (-r["level"], r["id"]))
+    complaint = facts.get("complaint")
 
-    # 3. Ultimate fallback
-    if not result:
-        result = (
-            "Active Recall Check",
-            "A short recall attempt helps you find a clear next step instead of rereading everything.",
-            [
-                "Pick one small part of the topic.",
-                "Try to explain it from memory.",
-                "Check your notes and fill in the gaps.",
-                "Repeat with the next part.",
-            ],
-        )
-        fired_rule = "default fallback"
-
-    method, reason, base_steps = result
-    cap = max_steps_for(total_minutes)
-
-    steps = apply_level(base_steps, level, display, struggle)
-    extra = deadline_step(days_left)
-    if extra:
-        if len(steps) < cap:
-            steps.insert(0, extra)
-        elif steps and steps[0].startswith("Warm up:"):
-            steps[0] = extra
-    steps = steps[:cap]
-
-    struggle_title = struggle.title()
-    countdown = deadline_guidance(days_left, exam)
-
-    if fired_rule == "default fallback":
-        fit = {"label": "Starting point", "basis": "No specific rule matched; using a general recall plan"}
-    elif fired_rule.startswith("generic:"):
-        fit = {"label": "Good match", "basis": "A general study rule matched this challenge"}
+    if top == 1:
+        advice = list(SELF_CARE.get(complaint, []))
     else:
-        fit = {"label": "Strong match", "basis": "A subject-specific rule matched"}
+        advice = list(ADVICE[top])
+    if "selfharm" in facts.get("redflags", []):
+        advice.insert(0, SELFHARM_ADVICE)
+
+    answers = []
+    for q in QUESTIONS:
+        if q["id"] in facts:
+            answer = facts[q["id"]]
+            values = answer if isinstance(answer, list) else [answer]
+            answers.append({"question": q["short"], "answer": "; ".join(label_of(q["id"], v) for v in values)})
 
     return {
-        "method": method,
-        "reason": reason,
-        "why": why_it_works(method, display, struggle_title, level, days_left),
-        "alternatives": build_alternatives(method, display, struggle_title, level, days_left),
-        "steps": steps,
-        "minutes": total_minutes,
-        "time_note": time_note_for(total_minutes),
-        "time_label": format_minutes(total_minutes),
-        "level": level,
-        "countdown": countdown,
-        "rule_used": fired_rule,
-        "fit": fit,
-        "subject": display,
-        "subject_family": family,
-        "struggle": struggle_title,
+        "level": top,
+        "key": level["key"],
+        "label": level["label"],
+        "action": level["action"],
+        "reasons": [describe_rule(r) for r in top_rules],
+        "also_noted": [describe_rule(r) for r in others],
+        "advice": advice,
+        "watch_for": WATCH_FOR.get(complaint, []) if top <= 2 else [],
+        "trace": [describe_rule(r) for r in sorted(fired, key=lambda r: (-r["level"], r["id"]))],
+        "answers": answers,
+        "questions_asked": len(facts),
+        "resolution": (
+            "Several rules can fire at once. The highest urgency among them decides the result, "
+            "so a danger sign is never outvoted by milder findings."
+        ),
+        "disclaimer": DISCLAIMER,
+    }
+
+
+def next_step(raw_facts):
+    """One turn of the consultation: the next question, or the final result."""
+    facts = validate_facts(raw_facts)
+    fired = fire_rules(facts)
+    # Stop early on an emergency: asking more questions would only delay help.
+    if any(r["level"] == 4 for r in fired):
+        return {"done": True, "result": build_result(facts, fired)}
+    pending = unanswered(facts)
+    if not pending:
+        return {"done": True, "result": build_result(facts, fired)}
+
+    question = pending[0]
+    return {
+        "done": False,
+        "question": {
+            "id": question["id"],
+            "text": question["text"],
+            "type": question["type"],
+            "options": question["options"],
+            "why": question["why"],
+            "used_by": rules_using(question["id"]),
+        },
+        "progress": {"answered": len(facts), "total": len(facts) + len(pending)},
     }
 
 
@@ -1096,39 +605,12 @@ def recommend(subject, struggle, time_available="medium", level=DEFAULT_LEVEL,
 # Request handling shared by the local server and the Vercel function
 # ---------------------------------------------------------------------------
 
-def _optional_int(value):
-    if value is None or value == "":
-        return None
+
+def handle_triage(data):
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def handle_struggles(data):
-    subject = clean_text(data.get("subject", ""), 60)
-    custom = clean_text(data.get("custom_subject", ""), 60)
-    if not subject and not custom:
-        return 400, "Choose a subject"
-    return 200, {"struggles": get_struggles(subject, data.get("level"), custom)}
-
-
-def handle_recommend(data):
-    subject = clean_text(data.get("subject", ""), 60)
-    custom = clean_text(data.get("custom_subject", ""), 60)
-    struggle = clean_text(data.get("struggle", ""), 80)
-    if not (subject or custom) or not struggle:
-        return 400, "Choose a subject and study challenge"
-    return 200, recommend(
-        subject,
-        struggle,
-        str(data.get("time", "medium")),
-        level=data.get("level"),
-        minutes=data.get("minutes"),
-        custom_subject=custom,
-        exam=data.get("exam"),
-        days_left=_optional_int(data.get("days_left")),
-    )
+        return 200, next_step(data.get("facts", {}))
+    except ValueError as err:
+        return 400, str(err)
 
 
 PUBLIC_FILES = {"/", "/index.html", "/robots.txt", "/sw.js", "/manifest.webmanifest"}
@@ -1164,22 +646,18 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Referrer-Policy", "no-referrer")
         super().end_headers()
 
     def do_POST(self):
-        if self.path == "/struggles":
-            handler = handle_struggles
-        elif self.path == "/recommend":
-            handler = handle_recommend
-        else:
+        if self.path != "/triage":
             self.send_error(404)
             return
         data = self._read_json()
         if data is None:
             self.send_error(400, "Please send valid JSON")
             return
-        status, payload = handler(data)
+        status, payload = handle_triage(data)
         if status != 200:
             self.send_error(status, payload)
             return
@@ -1202,13 +680,18 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        # Request lines only; answers are in the POST body and are never logged.
+        super().log_message(fmt, *args)
 
 
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", 8000), AppHandler)
-    print("Study Buddy is running at http://127.0.0.1:8000")
+    print("Symptom Triage Helper is running at http://127.0.0.1:8000")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

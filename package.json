@@ -1,7 +1,7 @@
 {
-  "name": "study-buddy",
+  "name": "symptom-triage-helper",
   "version": "1.0.0",
-  "description": "Expert System Study Method Recommender",
+  "description": "Rule-based expert system for symptom triage",
   "scripts": {
     "dev": "python app.py",
     "start": "python app.py"
